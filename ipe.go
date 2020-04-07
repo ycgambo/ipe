@@ -9,13 +9,13 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	log "github.com/golang/glog"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"gopkg.in/yaml.v2"
-
 	"ipe/api"
 	"ipe/app"
 	"ipe/config"
@@ -26,14 +26,38 @@ import (
 // Start Parse the configuration file and starts the ipe server
 // It Panic if could not start the HTTP or HTTPS server
 func Start(filename string) {
-	var conf config.File
-
 	rand.Seed(time.Now().Unix())
+
+	conf, _ := getConfFromFile(filename)
+	router, _ := getRouter(*conf)
+	var wg = sync.WaitGroup{}
+
+	serverErr := make(chan error)
+	wg.Add(1)
+	go func() {
+		log.Infof("Starting HTTP service on %s ...", conf.Host)
+		serverErr <- http.ListenAndServe(conf.Host, router)
+	}()
+
+	if conf.SSL.Enabled {
+		wg.Add(1)
+		go func() {
+			log.Infof("Starting HTTPS service on %s ...", conf.SSL.Host)
+			serverErr <- http.ListenAndServeTLS(conf.SSL.Host, conf.SSL.CertFile, conf.SSL.KeyFile, router)
+		}()
+	}
+
+	log.Info(<-serverErr)
+	wg.Wait()
+}
+
+func getConfFromFile(filename string) (*config.File, error) {
+	var conf config.File
 
 	data, err := ioutil.ReadFile(filename)
 	if err != nil {
 		log.Error(err)
-		return
+		return nil, err
 	}
 
 	// Expand env vars
@@ -42,9 +66,12 @@ func Start(filename string) {
 	// Decoding config
 	if err := yaml.UnmarshalStrict(data, &conf); err != nil {
 		log.Error(err)
-		return
+		return nil, err
 	}
+	return &conf, nil
+}
 
+func getRouter(conf config.File) (*mux.Router, error) {
 	// Using a in memory database
 	inMemoryStorage := storage.NewInMemory()
 
@@ -63,8 +90,7 @@ func Start(filename string) {
 		)
 
 		if err := inMemoryStorage.AddApp(application); err != nil {
-			log.Error(err)
-			return
+			return nil, err
 		}
 	}
 
@@ -93,14 +119,5 @@ func Start(filename string) {
 	appsRouter.Path("/channels/{channel_name}/users").Methods("GET").Handler(
 		api.NewGetChannelUsers(inMemoryStorage),
 	)
-
-	if conf.SSL.Enabled {
-		go func() {
-			log.Infof("Starting HTTPS service on %s ...", conf.SSL.Host)
-			log.Fatal(http.ListenAndServeTLS(conf.SSL.Host, conf.SSL.CertFile, conf.SSL.KeyFile, router))
-		}()
-	}
-
-	log.Infof("Starting HTTP service on %s ...", conf.Host)
-	log.Fatal(http.ListenAndServe(conf.Host, router))
+	return router, nil
 }
